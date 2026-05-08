@@ -6,6 +6,7 @@ import android.graphics.PixelFormat
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.VibrationEffect
 import android.os.Vibrator
 import android.util.Log
 import android.view.Gravity
@@ -18,7 +19,7 @@ class FloatingWindowManager(private val context: Context) {
 
     companion object {
         private const val TAG = "FloatingWindow"
-        private const val ICON_SIZE = 120 // dp converted to px later
+        private const val ICON_SIZE_DP = 42
         private const val DOUBLE_CLICK_THRESHOLD = 300L
         private const val ALERT_BLINK_INTERVAL = 600L
     }
@@ -29,24 +30,20 @@ class FloatingWindowManager(private val context: Context) {
     private var isShowing = false
     private var isAlert = false
 
-    // Drag state
     private var initialX = 0
     private var initialY = 0
     private var initialTouchX = 0f
     private var initialTouchY = 0f
     private var isDragging = false
 
-    // Double click detection
     private var lastClickTime = 0L
     private var clickCount = 0
     private val clickHandler = Handler(Looper.getMainLooper())
 
-    // Alert blink
     private val blinkHandler = Handler(Looper.getMainLooper())
     private var blinkRunnable: Runnable? = null
     private var blinkVisible = true
 
-    // Callbacks
     var onSingleClick: (() -> Unit)? = null
     var onDoubleClick: (() -> Unit)? = null
 
@@ -54,11 +51,12 @@ class FloatingWindowManager(private val context: Context) {
     fun show() {
         if (isShowing) return
 
-        val iconSizePx = (ICON_SIZE * context.resources.displayMetrics.density).toInt()
+        val density = context.resources.displayMetrics.density
+        val iconSizePx = (ICON_SIZE_DP * density).toInt()
 
         floatingView = ImageView(context).apply {
             setImageResource(R.drawable.ic_clipboard)
-            setBackgroundResource(android.R.drawable.dialog_holo_light_frame)
+            setBackgroundColor(0x80000000.toInt()) // 半透明黑色背景
             setPadding(4, 4, 4, 4)
         }
 
@@ -73,7 +71,7 @@ class FloatingWindowManager(private val context: Context) {
             iconSizePx,
             iconSizePx,
             flagType,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
@@ -81,8 +79,8 @@ class FloatingWindowManager(private val context: Context) {
             y = 300
         }
 
-        floatingView?.setOnTouchListener { v, event ->
-            handleTouch(v, event)
+        floatingView?.setOnTouchListener { _, event ->
+            handleTouch(event)
         }
 
         try {
@@ -93,7 +91,7 @@ class FloatingWindowManager(private val context: Context) {
         }
     }
 
-    private fun handleTouch(v: View, event: MotionEvent): Boolean {
+    private fun handleTouch(event: MotionEvent): Boolean {
         when (event.action) {
             MotionEvent.ACTION_DOWN -> {
                 initialX = layoutParams?.x ?: 0
@@ -108,14 +106,18 @@ class FloatingWindowManager(private val context: Context) {
                 val dx = event.rawX - initialTouchX
                 val dy = event.rawY - initialTouchY
 
-                if (!isDragging && (Math.abs(dx) > 10 || Math.abs(dy) > 10)) {
+                if (!isDragging && (kotlin.math.abs(dx) > 10 || kotlin.math.abs(dy) > 10)) {
                     isDragging = true
                 }
 
                 if (isDragging) {
                     layoutParams?.x = initialX + dx.toInt()
                     layoutParams?.y = initialY + dy.toInt()
-                    windowManager.updateViewLayout(floatingView, layoutParams)
+                    try {
+                        windowManager.updateViewLayout(floatingView, layoutParams)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to update layout", e)
+                    }
                 }
                 return true
             }
@@ -138,18 +140,16 @@ class FloatingWindowManager(private val context: Context) {
             lastClickTime = now
             clickHandler.postDelayed({
                 if (clickCount == 1) {
-                    // Single click
                     Log.d(TAG, "Single click")
                     onSingleClick?.invoke()
                 }
                 clickCount = 0
             }, DOUBLE_CLICK_THRESHOLD)
-        } else if (clickCount == 2) {
+        } else if (clickCount >= 2) {
             clickHandler.removeCallbacksAndMessages(null)
             clickCount = 0
 
             if (now - lastClickTime < DOUBLE_CLICK_THRESHOLD) {
-                // Double click
                 Log.d(TAG, "Double click")
                 onDoubleClick?.invoke()
             }
@@ -168,9 +168,9 @@ class FloatingWindowManager(private val context: Context) {
                 blinkVisible = !blinkVisible
                 floatingView?.visibility = if (blinkVisible) View.VISIBLE else View.INVISIBLE
 
-                // Switch icon color
                 if (blinkVisible) {
                     floatingView?.setImageResource(R.drawable.ic_clipboard_alert)
+                    floatingView?.setBackgroundColor(0x80FF9800.toInt()) // 橙色背景
                 }
 
                 blinkHandler.postDelayed(this, ALERT_BLINK_INTERVAL)
@@ -188,6 +188,7 @@ class FloatingWindowManager(private val context: Context) {
         floatingView?.apply {
             visibility = View.VISIBLE
             setImageResource(R.drawable.ic_clipboard)
+            setBackgroundColor(0x80000000.toInt())
         }
     }
 
@@ -217,26 +218,17 @@ class FloatingWindowManager(private val context: Context) {
         isAlert = false
     }
 
-    fun isShowing(): Boolean = isShowing
-
-    fun writeCachedToClipboard() {
-        val mqttManager = MqttManager.getInstance(context) ?: return
-        val cachedText = mqttManager.getCachedText() ?: return
-
-        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-        val clip = android.content.ClipData.newPlainText("clipboard_sync", cachedText)
-        clipboard.setPrimaryClip(clip)
-
-        // Vibrate feedback
-        val vibrator = context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            vibrator.vibrate(android.os.VibrationEffect.createOneShot(100, android.os.VibrationEffect.DEFAULT_AMPLITUDE))
-        } else {
-            @Suppress("DEPRECATION")
-            vibrator.vibrate(100)
+    fun vibrate() {
+        try {
+            val vibrator = context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator.vibrate(VibrationEffect.createOneShot(100, VibrationEffect.DEFAULT_AMPLITUDE))
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator.vibrate(100)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Vibrate failed", e)
         }
-
-        mqttManager.clearCachedText()
-        clearAlert()
     }
 }
