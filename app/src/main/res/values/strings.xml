@@ -1,0 +1,12 @@
+<resources>
+    <string name="app_name">剪贴板同步</string>
+    <string name="accessibility_description">监听全局复制操作，实现跨设备剪贴板同步</string>
+    <string name="notification_channel_name">剪贴板同步服务</string>
+    <string name="notification_title">剪贴板同步运行中</string>
+    <string name="notification_text">正在监听剪贴板变化并同步</string>
+    <string name="toast_clipboard_written">已写入剪贴板</string>
+    <string name="toast_service_stopped">服务已停止</string>
+    <string name="toast_overlay_required">请授予悬浮窗权限</string>
+    <string name="toast_accessibility_required">请开启无障碍服务</string>
+    <string name="toast_notification_required">请授予通知权限</string>
+</resources>
