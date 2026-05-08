@@ -12,6 +12,7 @@ class ClipboardAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val TAG = "ClipboardA11y"
+        private const val POLL_INTERVAL_MS = 2000L
         private const val DEBOUNCE_MS = 500L
         private var instance: ClipboardAccessibilityService? = null
         fun isRunning(): Boolean = instance != null
@@ -22,6 +23,7 @@ class ClipboardAccessibilityService : AccessibilityService() {
     private var lastPublishTime: Long = 0
     private var clipboardManager: ClipboardManager? = null
 
+    // 双保险：OnPrimaryClipChangedListener + 轮询
     private val clipListener = ClipboardManager.OnPrimaryClipChangedListener {
         Log.d(TAG, "onPrimaryClipChanged triggered")
         handler.removeCallbacks(checkRunnable)
@@ -34,25 +36,57 @@ class ClipboardAccessibilityService : AccessibilityService() {
         Log.d(TAG, "AccessibilityService connected")
 
         clipboardManager = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        clipboardManager?.addPrimaryClipChangedListener(clipListener)
 
+        // 方式1：注册剪贴板变化监听
+        try {
+            clipboardManager?.addPrimaryClipChangedListener(clipListener)
+            Log.d(TAG, "OnPrimaryClipChangedListener registered")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to register clip listener", e)
+        }
+
+        // 方式2：轮询兜底（每2秒检查一次剪贴板内容是否变化）
+        handler.postDelayed(pollRunnable, POLL_INTERVAL_MS)
+
+        // 启动前台服务
         ClipboardSyncService.start(this)
     }
 
+    private val pollRunnable = object : Runnable {
+        override fun run() {
+            checkClipboardContent()
+            handler.postDelayed(this, POLL_INTERVAL_MS)
+        }
+    }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        // 方式3：无障碍事件也触发检查（任何UI事件都检查下剪贴板）
+        if (event != null) {
+            handler.removeCallbacks(checkRunnable)
+            handler.postDelayed(checkRunnable, DEBOUNCE_MS)
+        }
+    }
+
     private val checkRunnable = Runnable {
+        checkClipboardContent()
+    }
+
+    private fun checkClipboardContent() {
         try {
-            val cm = clipboardManager ?: return@Runnable
-            if (!cm.hasPrimaryClip()) return@Runnable
+            val cm = clipboardManager ?: return
+            if (!cm.hasPrimaryClip()) return
 
-            val clip = cm.primaryClip ?: return@Runnable
-            if (clip.itemCount == 0) return@Runnable
+            val clip = cm.primaryClip ?: return
+            if (clip.itemCount == 0) return
 
-            val text = clip.getItemAt(0)?.text?.toString() ?: return@Runnable
-            if (text.isBlank()) return@Runnable
+            val text = clip.getItemAt(0)?.text?.toString() ?: return
+            if (text.isBlank()) return
+
+            // 去重：同一内容不重复发送
+            if (text == lastClipboardText) return
 
             val now = System.currentTimeMillis()
-            if (text == lastClipboardText) return@Runnable
-            if (now - lastPublishTime < 3000) return@Runnable
+            if (now - lastPublishTime < 2000) return
 
             lastClipboardText = text
             lastPublishTime = now
@@ -60,20 +94,22 @@ class ClipboardAccessibilityService : AccessibilityService() {
             Log.d(TAG, "Detected clipboard change: ${text.take(50)}...")
 
             val mqttManager = MqttManager.getInstance(this)
-            mqttManager?.publishClipboard(text)
+            if (mqttManager?.isConnected() == true) {
+                mqttManager.publishClipboard(text)
+            } else {
+                Log.w(TAG, "MQTT not connected, trying reconnect...")
+                mqttManager?.connect()
+            }
 
         } catch (e: Exception) {
             Log.e(TAG, "Error checking clipboard", e)
         }
     }
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // 纯靠OnPrimaryClipChangedListener，不依赖事件
-    }
-
     override fun onInterrupt() {
         clipboardManager?.removePrimaryClipChangedListener(clipListener)
         handler.removeCallbacks(checkRunnable)
+        handler.removeCallbacks(pollRunnable)
     }
 
     override fun onDestroy() {
@@ -81,6 +117,7 @@ class ClipboardAccessibilityService : AccessibilityService() {
         instance = null
         clipboardManager?.removePrimaryClipChangedListener(clipListener)
         handler.removeCallbacks(checkRunnable)
+        handler.removeCallbacks(pollRunnable)
         Log.d(TAG, "AccessibilityService destroyed")
     }
 }
