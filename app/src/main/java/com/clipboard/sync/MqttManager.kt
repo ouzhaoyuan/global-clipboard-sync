@@ -8,15 +8,12 @@ import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence
 import org.json.JSONObject
 import java.util.UUID
 
-/**
- * MQTT管理器 - 使用原生Paho客户端 + 协程
- * 不使用MqttAndroidClient（内部依赖废弃的IntentService，Android 14+必崩）
- */
 class MqttManager private constructor(private val context: Context) {
 
     companion object {
         private const val TAG = "MqttManager"
-        private const val BROKER_URL = "tcp://broker.hivemq.com:1883"
+        // 阿刁自己的服务器MQTT broker
+        private const val BROKER_URL = "tcp://8.138.56.213:1883"
         private const val TOPIC = "global/clipboard/sync"
         private const val CLIENT_ID_PREFIX = "gcs_"
 
@@ -52,9 +49,9 @@ class MqttManager private constructor(private val context: Context) {
     private var onNewClipboardReceived: ((String) -> Unit)? = null
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var reconnectJob: Job? = null
+    private var reconnectAttempt = 0
 
     init {
-        // 持久化deviceId，避免每次重启都变
         val prefs = context.getSharedPreferences("gcs_prefs", Context.MODE_PRIVATE)
         deviceId = prefs.getString("device_id", null) ?: UUID.randomUUID().toString().also {
             prefs.edit().putString("device_id", it).apply()
@@ -66,16 +63,12 @@ class MqttManager private constructor(private val context: Context) {
     }
 
     fun getCachedText(): String? = cachedText
-
-    fun clearCachedText() {
-        cachedText = null
-    }
+    fun clearCachedText() { cachedText = null }
+    fun isConnected(): Boolean = isConnected && mqttClient?.isConnected == true
 
     fun connect() {
         if (mqttClient?.isConnected == true) return
-        scope.launch {
-            tryConnect()
-        }
+        scope.launch { tryConnect() }
     }
 
     private suspend fun tryConnect() {
@@ -85,9 +78,9 @@ class MqttManager private constructor(private val context: Context) {
             mqttClient = MqttClient(BROKER_URL, clientId, persistence)
 
             val options = MqttConnectOptions().apply {
-                isAutomaticReconnect = false // 我们自己管重连
+                isAutomaticReconnect = false
                 isCleanSession = true
-                connectionTimeout = 30
+                connectionTimeout = 15
                 keepAliveInterval = 60
             }
 
@@ -102,20 +95,19 @@ class MqttManager private constructor(private val context: Context) {
                     handleMessage(topic, message)
                 }
 
-                override fun deliveryComplete(token: IMqttDeliveryToken?) {
-                    // no-op
-                }
+                override fun deliveryComplete(token: IMqttDeliveryToken?) {}
             })
 
             mqttClient?.connect(options)
             isConnected = true
-            Log.d(TAG, "MQTT connected successfully")
+            reconnectAttempt = 0
+            Log.d(TAG, "MQTT connected to $BROKER_URL")
 
             mqttClient?.subscribe(TOPIC, 1)
             Log.d(TAG, "Subscribed to $TOPIC")
 
         } catch (e: Exception) {
-            Log.e(TAG, "MQTT connect failed", e)
+            Log.e(TAG, "MQTT connect failed (attempt ${reconnectAttempt + 1})", e)
             isConnected = false
             scheduleReconnect()
         }
@@ -123,16 +115,19 @@ class MqttManager private constructor(private val context: Context) {
 
     private fun scheduleReconnect() {
         reconnectJob?.cancel()
+        // 指数退避：5s, 10s, 20s, 40s... 最长60s
+        val delay = minOf(5000L * (1L shl minOf(reconnectAttempt, 4)), 60000L)
+        reconnectAttempt++
         reconnectJob = scope.launch {
-            delay(5000)
-            Log.d(TAG, "Attempting MQTT reconnect...")
+            Log.d(TAG, "Reconnect in ${delay}ms...")
+            delay(delay)
             tryConnect()
         }
     }
 
     fun publishClipboard(text: String) {
         scope.launch {
-            if (!isConnected && mqttClient?.isConnected != true) {
+            if (mqttClient?.isConnected != true) {
                 Log.w(TAG, "Not connected, cannot publish")
                 return@launch
             }
@@ -142,11 +137,9 @@ class MqttManager private constructor(private val context: Context) {
                     put("text", text)
                     put("timestamp", System.currentTimeMillis())
                 }
-                val message = MqttMessage(json.toString().toByteArray()).apply {
-                    qos = 1
-                }
+                val message = MqttMessage(json.toString().toByteArray()).apply { qos = 1 }
                 mqttClient?.publish(TOPIC, message)
-                Log.d(TAG, "Published clipboard: ${text.take(30)}...")
+                Log.d(TAG, "Published: ${text.take(50)}...")
             } catch (e: Exception) {
                 Log.e(TAG, "Publish failed", e)
             }
@@ -165,7 +158,7 @@ class MqttManager private constructor(private val context: Context) {
                 return
             }
 
-            Log.d(TAG, "Received clipboard from $senderDeviceId: ${text.take(30)}...")
+            Log.d(TAG, "Received from $senderDeviceId: ${text.take(50)}...")
             cachedText = text
             onNewClipboardReceived?.invoke(text)
 

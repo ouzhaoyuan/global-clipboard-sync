@@ -1,133 +1,114 @@
 package com.clipboard.sync
 
-import android.Manifest
+import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.AccessibilityServiceInfo
+import android.app.Activity
+import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
+import android.util.Log
+import android.view.accessibility.AccessibilityManager
+import android.widget.TextView
 import android.widget.Toast
-import androidx.appcompat.app.AppCompatActivity
-import androidx.core.app.ActivityCompat
-import androidx.core.content.ContextCompat
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : Activity() {
 
     companion object {
-        private const val REQUEST_OVERLAY = 1001
-        private const val REQUEST_NOTIFICATION = 1002
-        private const val REQUEST_ACCESSIBILITY = 1003
+        private const val TAG = "MainActivity"
     }
+
+    private val handler = Handler(Looper.getMainLooper())
+    private var statusView: TextView? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        if (checkAllPermissions()) {
-            startServicesAndFinish()
-        } else {
-            requestMissingPermissions()
+        statusView = TextView(this).apply {
+            text = "正在检查权限..."
+            setTextSize(18f)
+            setPadding(80, 120, 80, 80)
+            setTextColor(0xFF333333.toInt())
+            setBackgroundColor(0xFFFFFFFF.toInt())
         }
+        setContentView(statusView)
+
+        checkAndRequestPermissions()
     }
 
-    private fun checkAllPermissions(): Boolean {
-        return hasOverlayPermission() &&
-                hasNotificationPermission() &&
-                isAccessibilityEnabled()
+    private fun checkAndRequestPermissions() {
+        // 1. 悬浮窗权限
+        if (!Settings.canDrawOverlays(this)) {
+            updateStatus("需要「显示在其他应用上层」权限\n\n请在设置中开启后返回")
+            val intent = Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))
+            startActivity(intent)
+            return
+        }
+
+        // 2. 无障碍服务
+        if (!isAccessibilityEnabled()) {
+            updateStatus("需要「无障碍服务」权限\n\n请在设置中找到本应用并开启\n开启后返回即可")
+            val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+            startActivity(intent)
+            return
+        }
+
+        // 3. 通知权限（Android 13+）
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 100)
+        }
+
+        // 4. 启动服务
+        ClipboardSyncService.start(this)
+
+        updateStatus("已启动！正在连接MQTT服务器...")
+
+        // 轮询连接状态
+        handler.postDelayed(object : Runnable {
+            override fun run() {
+                val mqtt = MqttManager.getInstance(this@MainActivity)
+                if (mqtt?.isConnected() == true) {
+                    updateStatus("运行中 ✓\n\n剪贴板同步已就绪\n复制文字即可自动同步到其他设备\n\n悬浮窗：单击=粘贴 双击=退出")
+                    // 连上后3秒自动关闭Activity
+                    handler.postDelayed({ finish() }, 3000)
+                    return
+                }
+                handler.postDelayed(this, 1000)
+            }
+        }, 1000)
     }
 
-    private fun hasOverlayPermission(): Boolean {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            Settings.canDrawOverlays(this)
-        } else true
+    private fun updateStatus(text: String) {
+        statusView?.text = text
     }
 
-    private fun hasNotificationPermission(): Boolean {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) ==
-                    PackageManager.PERMISSION_GRANTED
-        } else true
-    }
-
-    /**
-     * 使用 Settings.Secure 查询已启用的无障碍服务列表
-     * 比 AccessibilityManager.getEnabledAccessibilityServiceList() 可靠得多
-     * 后者在很多手机上明明开了也返回空列表
-     */
     private fun isAccessibilityEnabled(): Boolean {
-        val expectedService = "$packageName/${packageName}.ClipboardAccessibilityService"
-        val enabledServices = try {
-            Settings.Secure.getString(
+        val serviceName = "$packageName/.ClipboardAccessibilityService"
+        try {
+            val enabledServices = Settings.Secure.getString(
                 contentResolver,
                 Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
-            )
+            ) ?: return false
+            Log.d(TAG, "Enabled a11y: $enabledServices")
+            return enabledServices.contains(packageName)
         } catch (e: Exception) {
-            null
-        }
-        return enabledServices?.contains(expectedService) == true
-    }
-
-    private fun requestMissingPermissions() {
-        if (!hasOverlayPermission()) {
-            Toast.makeText(this, "请授予「显示在其他应用上层」权限", Toast.LENGTH_LONG).show()
-            val intent = Intent(
-                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                Uri.parse("package:$packageName")
-            )
-            startActivityForResult(intent, REQUEST_OVERLAY)
-            return
-        }
-
-        if (!hasNotificationPermission()) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                ActivityCompat.requestPermissions(
-                    this,
-                    arrayOf(Manifest.permission.POST_NOTIFICATIONS),
-                    REQUEST_NOTIFICATION
-                )
-            }
-            return
-        }
-
-        if (!isAccessibilityEnabled()) {
-            Toast.makeText(this, "请开启「无障碍服务」权限，找到 GlobalClipboardSync 并开启", Toast.LENGTH_LONG).show()
-            val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
-            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            startActivityForResult(intent, REQUEST_ACCESSIBILITY)
-            return
-        }
-
-        startServicesAndFinish()
-    }
-
-    @Deprecated("Using for simplicity on older APIs")
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)
-        // Re-check all permissions after returning from any settings page
-        if (checkAllPermissions()) {
-            startServicesAndFinish()
-        } else {
-            // Still missing some permission, continue requesting
-            requestMissingPermissions()
+            Log.e(TAG, "Failed to check accessibility", e)
+            return false
         }
     }
 
-    @Deprecated("Using for simplicity on older APIs")
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<out String>,
-        grantResults: IntArray
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (checkAllPermissions()) {
-            startServicesAndFinish()
-        } else {
-            requestMissingPermissions()
-        }
+    override fun onResume() {
+        super.onResume()
+        // 从权限设置页返回后重新检查
+        handler.postDelayed({ checkAndRequestPermissions() }, 500)
     }
 
-    private fun startServicesAndFinish() {
-        ClipboardSyncService.start(this)
-        finish()
+    override fun onDestroy() {
+        super.onDestroy()
+        handler.removeCallbacksAndMessages(null)
     }
 }

@@ -7,61 +7,58 @@ import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
-import org.json.JSONObject
 
 class ClipboardAccessibilityService : AccessibilityService() {
 
     companion object {
         private const val TAG = "ClipboardA11y"
-        private const val DEBOUNCE_MS = 800L
-        private var lastSentText: String = ""
-        private var lastSentTime: Long = 0
+        private const val DEBOUNCE_MS = 500L
+        private var instance: ClipboardAccessibilityService? = null
+        fun isRunning(): Boolean = instance != null
     }
 
     private val handler = Handler(Looper.getMainLooper())
     private var lastClipboardText: String = ""
+    private var lastPublishTime: Long = 0
+    private var clipboardManager: ClipboardManager? = null
 
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        if (event == null) return
-
-        // Monitor copy-related events
-        when (event.eventType) {
-            AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED,
-            AccessibilityEvent.TYPE_VIEW_CLICKED -> {
-                checkClipboard()
-            }
-        }
-    }
-
-    private fun checkClipboard() {
+    private val clipListener = ClipboardManager.OnPrimaryClipChangedListener {
+        Log.d(TAG, "onPrimaryClipChanged triggered")
         handler.removeCallbacks(checkRunnable)
         handler.postDelayed(checkRunnable, DEBOUNCE_MS)
     }
 
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        instance = this
+        Log.d(TAG, "AccessibilityService connected")
+
+        clipboardManager = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        clipboardManager?.addPrimaryClipChangedListener(clipListener)
+
+        ClipboardSyncService.start(this)
+    }
+
     private val checkRunnable = Runnable {
         try {
-            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-            if (!clipboard.hasPrimaryClip()) return@Runnable
+            val cm = clipboardManager ?: return@Runnable
+            if (!cm.hasPrimaryClip()) return@Runnable
 
-            val clip = clipboard.primaryClip ?: return@Runnable
+            val clip = cm.primaryClip ?: return@Runnable
             if (clip.itemCount == 0) return@Runnable
 
             val text = clip.getItemAt(0)?.text?.toString() ?: return@Runnable
-
             if (text.isBlank()) return@Runnable
 
-            // Dedup: same text or recent enough
             val now = System.currentTimeMillis()
-            if (text == lastSentText && now - lastSentTime < 3000) return@Runnable
             if (text == lastClipboardText) return@Runnable
+            if (now - lastPublishTime < 3000) return@Runnable
 
             lastClipboardText = text
-            lastSentText = text
-            lastSentTime = now
+            lastPublishTime = now
 
-            Log.d(TAG, "Detected clipboard change: ${text.take(30)}...")
+            Log.d(TAG, "Detected clipboard change: ${text.take(50)}...")
 
-            // Publish via MqttManager
             val mqttManager = MqttManager.getInstance(this)
             mqttManager?.publishClipboard(text)
 
@@ -70,12 +67,20 @@ class ClipboardAccessibilityService : AccessibilityService() {
         }
     }
 
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        // 纯靠OnPrimaryClipChangedListener，不依赖事件
+    }
+
     override fun onInterrupt() {
+        clipboardManager?.removePrimaryClipChangedListener(clipListener)
         handler.removeCallbacks(checkRunnable)
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        instance = null
+        clipboardManager?.removePrimaryClipChangedListener(clipListener)
         handler.removeCallbacks(checkRunnable)
+        Log.d(TAG, "AccessibilityService destroyed")
     }
 }
