@@ -18,21 +18,11 @@ jobs:
         java-version: '17'
         distribution: 'temurin'
 
-    - name: Create gradle wrapper
-      run: |
-        mkdir -p gradle/wrapper
-        cat > gradlew << 'GRADLEW'
-        #!/bin/sh
-        exec gradle "$@"
-        GRADLEW
-        chmod +x gradlew
-
     - name: Setup Gradle
       uses: gradle/actions/setup-gradle@v3
 
     - name: Build Release APK
-      run: |
-        ./gradlew assembleRelease --no-daemon
+      run: gradle assembleRelease --no-daemon
 
     - name: Sign APK
       uses: r0adkll/sign-android-release@v1
